@@ -29,7 +29,19 @@ if VONAGE_API_KEY and VONAGE_API_SECRET:
     auth = Auth(api_key=VONAGE_API_KEY, api_secret=VONAGE_API_SECRET)
     vonage = Vonage(auth=auth)
 
+def normalize_text(text: str) -> str:
+    return (
+        text.replace("\u2019", "'")
+        .replace("\u2018", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u2026", "...")
+    )
+
 def send_sms(to_number: str, text: str):
+    text = normalize_text(text or "")
     if not vonage:
         return {"status": "error", "message": "Vonage client not configured"}, 500
     if not VONAGE_FROM:
