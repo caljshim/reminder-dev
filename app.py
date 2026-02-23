@@ -6,6 +6,8 @@ from openai import OpenAI
 from threading import Thread
 import time
 import json
+from vonage import Vonage, Auth
+from vonage_sms import SmsMessage, SmsResponse
 
 # Load .env file
 load_dotenv()
@@ -17,22 +19,40 @@ openai_api_key = os.getenv("OPENAI_SECRET_KEY", "default_fallback")
 
 client = OpenAI(api_key=openai_api_key)
 
-@app.route("/sms", methods=["POST"])
+VONAGE_API_SECRET = os.getenv("VONAGE_API_SECRET")
+VONAGE_API_KEY = os.getenv("VONAGE_API_KEY")
+VONAGE_FROM = os.getenv("VONAGE_FROM_NUMBER", "")
+ALLOWED_NUMBER = os.getenv("ALLOWED_NUMBER", "")
+
+vonage = None
+if VONAGE_API_KEY and VONAGE_API_SECRET:
+    auth = Auth(api_key=VONAGE_API_KEY, api_secret=VONAGE_API_SECRET)
+    vonage = Vonage(auth=auth)
+
+def send_sms(to_number: str, text: str):
+    if not vonage:
+        return {"status": "error", "message": "Vonage client not configured"}, 500
+    if not VONAGE_FROM:
+        return {"status": "error", "message": "VONAGE_FROM_NUMBER not set"}, 500
+
+    message = SmsMessage(to=to_number, from_=VONAGE_FROM, text=text)
+    response: SmsResponse = vonage.sms.send(message)
+    return {"status": "ok", "response": response.model_dump(exclude_unset=True)}, 200
+
+
+@app.route("/sms", methods=["GET", "POST"])
 def sms_webhook():
     """
-    Twilio will POST incoming SMS here.
-    We respond with simple TwiML that says 'hello'.
+    Inbound SMS webhook (Vonage or Twilio).
+    Uses the goon JSON flow and sends SMS replies.
     """
+    incoming_msg = request.values.get("text") or request.form.get("Body", "")
+    from_number = request.values.get("msisdn") or request.form.get("From", "")
 
-    incoming_msg = request.form.get("Body", "")
-    from_number = request.form.get("From", "")
+    if ALLOWED_NUMBER and from_number and from_number != ALLOWED_NUMBER:
+        return {"status": "forbidden"}, 403
 
-    print("Received message:", incoming_msg)
-    print("From number:", from_number)
-
-    resp = MessagingResponse()
-    resp.message("hello")
-    return str(resp)
+    return test_goon_json(incoming_msg=incoming_msg, from_number=from_number)
 
 def parse_reminder(incoming_msg: str) -> tuple[int | None, str]:
     """
@@ -97,64 +117,21 @@ def generate_verification(incoming_msg: str, seconds: int, message: str) -> str:
 
     return res.choices[0].message.content.strip()
 
-def send_reminder(delay_seconds, msg, verification):
-    print(verification)
+def send_reminder(delay_seconds, msg, to_number):
     time.sleep(delay_seconds)
-    print(f"REMINDER: {msg}")
+    if to_number:
+        send_sms(to_number, msg)
+    else:
+        print(f"REMINDER: {msg}")
     return
 
 @app.route("/test-openai", methods=["POST"])
 def openai_test():
-    incoming_msg = (request.form.get("Body", "") or "").strip()
-
-    if not incoming_msg:
-        return {"status": "error", "message": "Boss, you didn't tell me anything to remember."}, 400
-
-    # 1) Parse the reminder
-    seconds, reminder_text = parse_reminder(incoming_msg)
-
-    # Basic validation
-    if seconds is None or not isinstance(seconds, int) or seconds <= 0:
-        # Let the goon complain politely about missing time
-        goon_res = client.chat.completions.create(
-            model=GOON_MODEL,
-            temperature=0.7,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an overworked but loyal mob boss's goon who "
-                        "handles reminders. Keep replies short, dry, casual. "
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"The boss said: '{incoming_msg}'. "
-                        "You couldn't figure out when they want the reminder. "
-                        "Ask them to give you a time in seconds or a clear duration."
-                    ),
-                },
-            ],
-        )
-        msg = goon_res.choices[0].message.content.strip()
-        return {"status": "error", "message": msg}, 200
-
-    # 2) Generate in-character verification
-    verification_msg = generate_verification(incoming_msg, seconds, reminder_text)
-
-    # 3) Schedule the reminder in the background
-    Thread(
-        target=send_reminder,
-        args=(seconds, reminder_text, verification_msg),
-        daemon=True,
-    ).start()
-
-    # 4) Respond to the user (e.g. Twilio will send this back as SMS body if you format TwiML)
-    return {"status": "ok", "message": verification_msg}, 200
+    incoming_msg = request.form.get("Body", "")
+    return test_goon_json(incoming_msg=incoming_msg, from_number=None)
 
 @app.route("/test-goon-json", methods=["POST"])
-def test_goon_json():
+def test_goon_json(incoming_msg=None, from_number=None):
     """
     Single-call version:
     - Uses the fine-tuned goon model
@@ -162,7 +139,8 @@ def test_goon_json():
     - Generates in-character verification
     - Returns JSON with those fields
     """
-    incoming_msg = (request.form.get("Body", "") or "").strip()
+    if incoming_msg is None:
+        incoming_msg = request.form.get("Body", "") or request.values.get("text", "")
 
     if not incoming_msg:
         return {
@@ -211,14 +189,18 @@ def test_goon_json():
 
     # If we got a valid delay, schedule the reminder
     if isinstance(seconds, int) and seconds > 0:
+        if from_number and verification_msg:
+            send_sms(from_number, verification_msg)
         Thread(
             target=send_reminder,
-            args=(seconds, reminder_text, verification_msg),
+            args=(seconds, reminder_text, from_number),
             daemon=True,
         ).start()
         status = "ok"
     else:
         # No valid time parsed – we still return the verification (likely asking for clarification)
+        if from_number and verification_msg:
+            send_sms(from_number, verification_msg)
         status = "needs_time"
 
     return {
@@ -227,6 +209,34 @@ def test_goon_json():
         "message": reminder_text,
         "verification": verification_msg,
     }, 200
+
+
+@app.route("/test", methods=["GET", "POST"])
+def vonage_test():
+    """
+    Vonage inbound SMS webhook.
+    If a user texts 'test', reply with 'Hello!'.
+    """
+    incoming_text = (request.values.get("text", "") or "").strip()
+    from_number = (request.values.get("msisdn", "") or "").strip()
+
+    if not incoming_text or not from_number:
+        return {"status": "error", "message": "Missing text or msisdn"}, 400
+
+    if ALLOWED_NUMBER and from_number != ALLOWED_NUMBER:
+        return {"status": "forbidden"}, 403
+
+    if incoming_text.lower() == "test":
+        if not vonage:
+            return {"status": "error", "message": "Vonage client not configured"}, 500
+        if not VONAGE_FROM:
+            return {"status": "error", "message": "VONAGE_FROM_NUMBER not set"}, 500
+
+        message = SmsMessage(to=from_number, from_=VONAGE_FROM, text="Hello!")
+        response: SmsResponse = vonage.sms.send(message)
+        return {"status": "ok", "response": response.model_dump(exclude_unset=True)}, 200
+
+    return {"status": "ignored"}, 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
