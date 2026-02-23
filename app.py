@@ -184,7 +184,7 @@ def test_goon_json(incoming_msg=None, from_number=None):
                     '  "verification": "<string>"\n'
                     "}\n\n"
                     "- seconds: delay in seconds from now (integer). If you truly can't tell, use null.\n"
-                    "- message: short reminder phrase.\n"
+                    "- message: short reminder phrase, talking to 'boss' in your style.\n"
                     "- verification: 1–2 short sentences, talking to 'boss' in your style.\n"
                     "No extra keys. No extra text outside the JSON."
                 ),
